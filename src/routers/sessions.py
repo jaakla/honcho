@@ -4,9 +4,10 @@ from contextlib import suppress
 from fastapi import APIRouter, Body, Depends, Path, Query, Response
 from fastapi_pagination import Page
 from fastapi_pagination.ext.sqlalchemy import apaginate
+from sqlalchemy import distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src import config, crud, schemas
+from src import config, crud, models, schemas
 from src.cache.client import safe_cache_delete
 from src.crud.session import session_cache_key
 from src.dependencies import db
@@ -332,6 +333,41 @@ async def update_session(
     except ValueError as e:
         logger.warning(f"Failed to update session {session_id}: {str(e)}")
         raise ResourceNotFoundException("Session not found") from e
+
+
+@router.get(
+    "/{session_id}/stats",
+    response_model=schemas.SessionStats,
+    dependencies=[
+        Depends(require_auth(workspace_name="workspace_id", session_name="session_id"))
+    ],
+)
+async def get_session_stats(
+    workspace_id: str = Path(...),
+    session_id: str = Path(...),
+    db: AsyncSession = db,
+):
+    """Get simple message-derived stats for a Session."""
+    stmt = select(
+        func.count(models.Message.id),
+        func.count(distinct(models.Message.peer_name)),
+        func.min(models.Message.created_at),
+        func.max(models.Message.created_at),
+    ).where(
+        models.Message.workspace_name == workspace_id,
+        models.Message.session_name == session_id,
+    )
+
+    message_count, distinct_peer_count, first_message_at, last_message_at = (
+        await db.execute(stmt)
+    ).one()
+
+    return schemas.SessionStats(
+        message_count=int(message_count or 0),
+        distinct_peer_count=int(distinct_peer_count or 0),
+        first_message_at=first_message_at,
+        last_message_at=last_message_at,
+    )
 
 
 @router.delete(
@@ -779,6 +815,34 @@ async def get_session_summaries(
         short_summary=short_summary_schema,
         long_summary=long_summary_schema,
     )
+
+
+@router.post(
+    "/{session_id}/summaries/refresh",
+    status_code=204,
+    dependencies=[
+        Depends(require_auth(workspace_name="workspace_id", session_name="session_id"))
+    ],
+)
+async def refresh_session_summaries(
+    workspace_id: str = Path(...),
+    session_id: str = Path(...),
+) -> None:
+    """
+    Force-regenerate short and long summaries for a session.
+
+    This bypasses normal threshold/existence checks and rebuilds summaries from
+    the full session history using the currently configured model, prompts, and
+    token limits.
+    """
+    try:
+        await summarizer.refresh_session_summaries(
+            workspace_name=workspace_id,
+            session_name=session_id,
+        )
+    except ValueError as e:
+        logger.warning("Failed to refresh summaries for session %s: %s", session_id, e)
+        raise ValidationException(str(e)) from e
 
 
 @router.post(

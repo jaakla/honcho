@@ -355,6 +355,21 @@ class Session(SessionBase):
     )
 
 
+class SessionStats(BaseModel):
+    message_count: int = Field(description="Total number of messages in the session")
+    distinct_peer_count: int = Field(
+        description="Number of distinct peers who have messages in the session"
+    )
+    first_message_at: datetime.datetime | None = Field(
+        default=None,
+        description="Timestamp of the earliest message in the session, or null if empty",
+    )
+    last_message_at: datetime.datetime | None = Field(
+        default=None,
+        description="Timestamp of the latest message in the session, or null if empty",
+    )
+
+
 class Summary(BaseModel):
     content: str = Field(description="The summary text")
     message_id: int = Field(

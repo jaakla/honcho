@@ -1,12 +1,13 @@
 import asyncio
 import logging
+import re
 import time
 from enum import Enum
 from functools import cache
 from inspect import cleandoc as c
 from typing import TypedDict
 
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import schemas
@@ -54,6 +55,25 @@ class Summary(TypedDict):
     message_public_id: str
 
 
+class SummaryRefreshMessage(TypedDict):
+    """Detached-safe message snapshot used for summary refresh."""
+
+    id: int
+    public_id: str
+    peer_name: str
+    content: str
+    token_count: int
+
+
+class SummarySegment(TypedDict):
+    """Intermediate summary segment used during balanced refresh rebuilds."""
+
+    content: str
+    token_count: int
+    message_id: int
+    message_public_id: str
+
+
 def to_schema_summary(s: Summary) -> schemas.Summary:
     return schemas.Summary(
         content=s["content"],
@@ -67,6 +87,7 @@ def to_schema_summary(s: Summary) -> schemas.Summary:
 
 # Export the public functions
 __all__ = [
+    "refresh_session_summaries",
     "get_summary",
     "get_both_summaries",
     "get_summarized_history",
@@ -81,6 +102,9 @@ __all__ = [
 # Configuration constants for summaries
 MESSAGES_PER_SHORT_SUMMARY = settings.SUMMARY.MESSAGES_PER_SHORT_SUMMARY
 MESSAGES_PER_LONG_SUMMARY = settings.SUMMARY.MESSAGES_PER_LONG_SUMMARY
+MIN_SHORT_SUMMARY_WORDS = 120
+SHORT_SUMMARY_WORDS_PER_OUTPUT_TOKEN = 0.25
+LONG_SUMMARY_WORDS_PER_OUTPUT_TOKEN = 0.35
 
 SUMMARIES_KEY = "summaries"
 
@@ -89,6 +113,44 @@ SUMMARIES_KEY = "summaries"
 class SummaryType(Enum):
     SHORT = "honcho_chat_summary_short"
     LONG = "honcho_chat_summary_long"
+
+
+def _hit_output_length_limit(finish_reasons: list[str]) -> bool:
+    """Return True when the model stopped because it ran out of output budget."""
+    for reason in finish_reasons:
+        normalized = reason.strip().lower()
+        if normalized == "length":
+            return True
+        if "max_tokens" in normalized or "max_output_tokens" in normalized:
+            return True
+        if "token" in normalized and "max" in normalized:
+            return True
+    return False
+
+
+def _trim_partial_summary(summary_text: str) -> str:
+    """Trim capped summaries back to a clean word boundary."""
+    trimmed = summary_text.rstrip()
+    if not trimmed:
+        return trimmed
+
+    if trimmed[-1] in ".!?)]}\"'":
+        return trimmed
+
+    if trimmed[-1].isalnum():
+        boundary = max(
+            trimmed.rfind(" "),
+            trimmed.rfind("\n"),
+            trimmed.rfind("\t"),
+        )
+        if boundary > 0:
+            trimmed = trimmed[:boundary].rstrip()
+        else:
+            trimmed = re.sub(r"\w+$", "", trimmed).rstrip()
+
+    if trimmed and trimmed[-1] not in ".!?":
+        return f"{trimmed}..."
+    return trimmed
 
 
 def short_summary_prompt(
@@ -104,6 +166,7 @@ You are a system that summarizes parts of a conversation to create a concise and
 2. User preferences, opinions, and questions
 3. Important context and requests
 4. Core topics discussed
+5. Decisions made, open questions, and pending follow-up items
 
 If there is a previous summary, ALWAYS make your new summary inclusive of both it and the new messages, therefore capturing the ENTIRE conversation. Prioritize key facts across the entire conversation.
 
@@ -112,7 +175,7 @@ LANGUAGE PRESERVATION:
 - Do NOT translate the conversation into English or any other language.
 - If the conversation is mixed-language, keep the dominant language of the conversation and preserve quoted phrases in their original language when useful.
 
-Provide a concise, factual summary that captures the essence of the conversation. Your summary should be detailed enough to serve as context for future messages, but brief enough to be helpful. Prefer a thorough chronological narrative over a list of bullet points.
+Provide a compact but complete factual summary that captures the conversation well enough to continue it later without rereading the messages. Preserve names, numbers, decisions, requests, and unresolved items whenever they matter. Prefer a thorough chronological narrative over a list of bullet points.
 
 Return only the summary without any explanation or meta-commentary.
 
@@ -124,7 +187,7 @@ Return only the summary without any explanation or meta-commentary.
 {formatted_messages}
 </conversation>
 
-Hard limit: {output_words} words maximum. If needed, drop lower-priority detail to stay within the limit.
+Target length: about {output_words} words. It is acceptable to go somewhat shorter or longer if needed to preserve critical context, but do not waste space on minor repetition.
 """)
 
 
@@ -167,6 +230,69 @@ Hard limit: {output_words} words maximum. If needed, drop lower-priority detail 
 """)
 
 
+def short_summary_merge_prompt(
+    formatted_segments: str,
+    output_words: int,
+) -> str:
+    """Generate the short summary merge prompt for balanced refresh rebuilds."""
+    return c(f"""
+You are a system that merges chronological summary segments into one accurate session summary.
+
+Each segment summarizes a different part of the same conversation. Your job is to combine them into one coherent summary without over-weighting the earliest segments.
+
+Focus on preserving:
+1. Key facts and information shared
+2. Important decisions, requests, and open questions
+3. Names, numbers, dates, and commitments
+4. The chronological development of the conversation
+
+Rules:
+- Treat all segments as equally important evidence for the final summary.
+- Preserve later developments, corrections, and reversals when they matter.
+- Avoid repeating the same detail multiple times.
+- Write in the same primary language as the segments.
+- Return only the merged summary.
+
+<summary_segments>
+{formatted_segments}
+</summary_segments>
+
+Target length: about {output_words} words. It is acceptable to go somewhat shorter or longer if needed to preserve critical context, but do not waste space on repetition.
+""")
+
+
+def long_summary_merge_prompt(
+    formatted_segments: str,
+    output_words: int,
+) -> str:
+    """Generate the long summary merge prompt for balanced refresh rebuilds."""
+    return c(f"""
+You are a system that merges chronological summary segments into one thorough, comprehensive session summary.
+
+Each segment summarizes a different part of the same conversation. Your job is to combine them into one coherent summary without over-weighting the earliest segments.
+
+Focus on preserving:
+1. Key facts and information shared
+2. Important decisions, requests, and open questions
+3. Names, numbers, dates, and commitments
+4. Themes, patterns, and shifts in the conversation
+5. The chronological development of the conversation, including later updates or reversals
+
+Rules:
+- Treat all segments as equally important evidence for the final summary.
+- Preserve later developments, corrections, and reversals when they matter.
+- Avoid repeating the same detail multiple times.
+- Write in the same primary language as the segments.
+- Return only the merged summary.
+
+<summary_segments>
+{formatted_segments}
+</summary_segments>
+
+Hard limit: {output_words} words maximum. If needed, drop lower-priority detail to stay within the limit.
+""")
+
+
 @cache
 def estimate_short_summary_prompt_tokens() -> int:
     """Estimate tokens for the short summary prompt (without messages/previous_summary)."""
@@ -199,6 +325,34 @@ def estimate_long_summary_prompt_tokens() -> int:
         return 200
 
 
+@cache
+def estimate_short_summary_merge_prompt_tokens() -> int:
+    """Estimate tokens for the short summary merge prompt (without segments)."""
+    try:
+        return estimate_tokens(
+            short_summary_merge_prompt(
+                formatted_segments="",
+                output_words=0,
+            )
+        )
+    except Exception:
+        return 200
+
+
+@cache
+def estimate_long_summary_merge_prompt_tokens() -> int:
+    """Estimate tokens for the long summary merge prompt (without segments)."""
+    try:
+        return estimate_tokens(
+            long_summary_merge_prompt(
+                formatted_segments="",
+                output_words=0,
+            )
+        )
+    except Exception:
+        return 200
+
+
 @conditional_observe(name="Create Short Summary")
 async def create_short_summary(
     formatted_messages: str,
@@ -207,10 +361,15 @@ async def create_short_summary(
 ) -> HonchoLLMCallResponse[str]:
     # input_tokens indicates how many tokens the message list + previous summary take up
     # we want to optimize short summaries to be smaller than the actual content being summarized
-    # so we ask the agent to produce a word count roughly equal to either the input, or the max
-    # size if the input is larger. the word/token ratio is roughly 4:3 so we multiply by 0.75.
-    # LLMs *seem* to respond better to getting asked for a word count but should workshop this.
-    output_words = int(min(input_tokens, settings.SUMMARY.MAX_TOKENS_SHORT) * 0.75)
+    # so we ask the model for a conservative word count that will fit comfortably
+    # within the configured output-token limit across languages/providers.
+    output_words = max(
+        MIN_SHORT_SUMMARY_WORDS,
+        int(
+            min(input_tokens, settings.SUMMARY.MAX_TOKENS_SHORT)
+            * SHORT_SUMMARY_WORDS_PER_OUTPUT_TOKEN
+        ),
+    )
 
     if previous_summary:
         previous_summary_text = previous_summary
@@ -233,9 +392,11 @@ async def create_long_summary(
     formatted_messages: str,
     previous_summary: str | None = None,
 ) -> HonchoLLMCallResponse[str]:
-    # the word/token ratio is roughly 4:3 so we multiply by 0.75.
-    # LLMs *seem* to respond better to getting asked for a word count but should workshop this.
-    output_words = int(settings.SUMMARY.MAX_TOKENS_LONG * 0.75)
+    # Use a conservative words-per-token ratio so the requested target length
+    # fits under the actual generation budget.
+    output_words = int(
+        settings.SUMMARY.MAX_TOKENS_LONG * LONG_SUMMARY_WORDS_PER_OUTPUT_TOKEN
+    )
 
     if previous_summary:
         previous_summary_text = previous_summary
@@ -246,6 +407,41 @@ async def create_long_summary(
         formatted_messages, output_words, previous_summary_text
     )
 
+    return await honcho_llm_call(
+        llm_settings=settings.SUMMARY,
+        prompt=prompt,
+        max_tokens=settings.SUMMARY.MAX_TOKENS_LONG,
+    )
+
+
+@conditional_observe(name="Merge Short Summary Segments")
+async def merge_short_summary_segments(
+    formatted_segments: str,
+    input_tokens: int,
+) -> HonchoLLMCallResponse[str]:
+    output_words = max(
+        MIN_SHORT_SUMMARY_WORDS,
+        int(
+            min(input_tokens, settings.SUMMARY.MAX_TOKENS_SHORT)
+            * SHORT_SUMMARY_WORDS_PER_OUTPUT_TOKEN
+        ),
+    )
+    prompt = short_summary_merge_prompt(formatted_segments, output_words)
+    return await honcho_llm_call(
+        llm_settings=settings.SUMMARY,
+        prompt=prompt,
+        max_tokens=settings.SUMMARY.MAX_TOKENS_SHORT,
+    )
+
+
+@conditional_observe(name="Merge Long Summary Segments")
+async def merge_long_summary_segments(
+    formatted_segments: str,
+) -> HonchoLLMCallResponse[str]:
+    output_words = int(
+        settings.SUMMARY.MAX_TOKENS_LONG * LONG_SUMMARY_WORDS_PER_OUTPUT_TOKEN
+    )
+    prompt = long_summary_merge_prompt(formatted_segments, output_words)
     return await honcho_llm_call(
         llm_settings=settings.SUMMARY,
         prompt=prompt,
@@ -572,6 +768,10 @@ async def _create_summary(
         llm_input_tokens = response.input_tokens
         llm_output_tokens = response.output_tokens
 
+        if _hit_output_length_limit(response.finish_reasons):
+            summary_text = _trim_partial_summary(summary_text)
+            summary_tokens = estimate_tokens(summary_text) if summary_text else 0
+
         # Detect potential issues with the summary
         if not summary_text.strip():
             logger.error(
@@ -611,6 +811,153 @@ async def _create_summary(
         llm_input_tokens,
         llm_output_tokens,
     )
+
+
+async def _merge_summary_segments(
+    summary_type: SummaryType,
+    segments: list[SummarySegment],
+) -> SummarySegment:
+    """Merge a set of already-compressed chronological summary segments."""
+    formatted_segments = "\n".join(
+        f"segment_{index}: {segment['content']}"
+        for index, segment in enumerate(segments, start=1)
+    )
+    input_tokens = estimate_tokens(formatted_segments)
+
+    response: HonchoLLMCallResponse[str] | None = None
+    summary_text = ""
+    summary_tokens = 0
+    try:
+        if summary_type == SummaryType.SHORT:
+            response = await merge_short_summary_segments(formatted_segments, input_tokens)
+        else:
+            response = await merge_long_summary_segments(formatted_segments)
+
+        summary_text = response.content
+        summary_tokens = response.output_tokens
+        if _hit_output_length_limit(response.finish_reasons):
+            summary_text = _trim_partial_summary(summary_text)
+            summary_tokens = estimate_tokens(summary_text) if summary_text else 0
+    except Exception:
+        logger.exception("Error merging summary segments!")
+        summary_text = "\n\n".join(segment["content"] for segment in segments)
+        summary_tokens = estimate_tokens(summary_text) if summary_text else 0
+
+    if not summary_text.strip():
+        summary_text = "\n\n".join(segment["content"] for segment in segments)
+        summary_tokens = estimate_tokens(summary_text) if summary_text else 0
+
+    return SummarySegment(
+        content=summary_text,
+        token_count=summary_tokens,
+        message_id=segments[-1]["message_id"],
+        message_public_id=segments[-1]["message_public_id"],
+    )
+
+
+def _refresh_generation_content_budget(summary_type: SummaryType) -> int:
+    """Token budget for raw-message chunks during manual refresh."""
+    max_output = (
+        settings.SUMMARY.MAX_TOKENS_SHORT
+        if summary_type == SummaryType.SHORT
+        else settings.SUMMARY.MAX_TOKENS_LONG
+    )
+    prompt_tokens = (
+        estimate_short_summary_prompt_tokens()
+        if summary_type == SummaryType.SHORT
+        else estimate_long_summary_prompt_tokens()
+    )
+    ratio = 1.5 if summary_type == SummaryType.SHORT else 2.0
+    return max(int(max_output * ratio), max_output) - prompt_tokens
+
+
+def _refresh_merge_content_budget(summary_type: SummaryType) -> int:
+    """Token budget for merging summary segments during manual refresh."""
+    max_output = (
+        settings.SUMMARY.MAX_TOKENS_SHORT
+        if summary_type == SummaryType.SHORT
+        else settings.SUMMARY.MAX_TOKENS_LONG
+    )
+    prompt_tokens = (
+        estimate_short_summary_merge_prompt_tokens()
+        if summary_type == SummaryType.SHORT
+        else estimate_long_summary_merge_prompt_tokens()
+    )
+    ratio = 2.0 if summary_type == SummaryType.SHORT else 3.0
+    return max(int(max_output * ratio), max_output) - prompt_tokens
+
+
+def _refresh_message_line_token_count(message: SummaryRefreshMessage) -> int:
+    """Estimate token count for one formatted message line."""
+    return estimate_tokens(f"{message['peer_name']}: {message['content']}")
+
+
+def _refresh_segment_line_token_count(segment: SummarySegment) -> int:
+    """Estimate token count for one formatted summary-segment line."""
+    return estimate_tokens(f"segment: {segment['content']}")
+
+
+def _chunk_messages_for_refresh(
+    messages: list[SummaryRefreshMessage],
+    summary_type: SummaryType,
+) -> list[list[SummaryRefreshMessage]]:
+    """Split raw session messages into token-budgeted chunks."""
+    content_budget = max(_refresh_generation_content_budget(summary_type), 1)
+    chunks: list[list[SummaryRefreshMessage]] = []
+    current_chunk: list[SummaryRefreshMessage] = []
+    current_tokens = 0
+
+    for message in messages:
+        line_tokens = _refresh_message_line_token_count(message)
+        if current_chunk and current_tokens + line_tokens > content_budget:
+            chunks.append(current_chunk)
+            current_chunk = [message]
+            current_tokens = line_tokens
+        else:
+            current_chunk.append(message)
+            current_tokens += line_tokens
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
+
+
+def _chunk_segments_for_merge(
+    segments: list[SummarySegment],
+    summary_type: SummaryType,
+) -> list[list[SummarySegment]]:
+    """Split summary segments into token-budgeted merge groups."""
+    if len(segments) <= 1:
+        return [segments]
+
+    segment_line_tokens = [_refresh_segment_line_token_count(segment) for segment in segments]
+    dynamic_floor = max(segment_line_tokens) * 2
+    content_budget = max(_refresh_merge_content_budget(summary_type), dynamic_floor)
+
+    groups: list[list[SummarySegment]] = []
+    current_group: list[SummarySegment] = []
+    current_tokens = 0
+
+    for segment, line_tokens in zip(segments, segment_line_tokens, strict=False):
+        if current_group and current_tokens + line_tokens > content_budget:
+            groups.append(current_group)
+            current_group = [segment]
+            current_tokens = line_tokens
+        else:
+            current_group.append(segment)
+            current_tokens += line_tokens
+
+    if current_group:
+        groups.append(current_group)
+
+    if len(groups) == len(segments):
+        forced_groups: list[list[SummarySegment]] = []
+        for index in range(0, len(segments), 2):
+            forced_groups.append(segments[index : index + 2])
+        return forced_groups
+
+    return groups
 
 
 async def _save_summary(
@@ -663,6 +1010,136 @@ async def _save_summary(
 
     cache_key = session_cache_key(workspace_name, session_name)
     await cache_client.delete(cache_key)
+
+
+async def _rebuild_summary_from_scratch(
+    workspace_name: str,
+    session_name: str,
+    *,
+    summary_type: SummaryType,
+    messages: list[SummaryRefreshMessage],
+) -> None:
+    """Regenerate a summary slot from the full session history using balanced merges."""
+    leaf_segments: list[SummarySegment] = []
+
+    for chunk in _chunk_messages_for_refresh(messages, summary_type):
+        if not chunk:
+            continue
+
+        formatted_messages = "\n".join(
+            f"{message['peer_name']}: {message['content']}" for message in chunk
+        )
+        messages_tokens = estimate_tokens(formatted_messages)
+
+        latest_summary, _, _, _ = await _create_summary(
+            formatted_messages=formatted_messages,
+            previous_summary_text=None,
+            summary_type=summary_type,
+            input_tokens=messages_tokens,
+            message_public_id=chunk[-1]["public_id"],
+            last_message_id=chunk[-1]["id"],
+            last_message_content_preview=chunk[-1]["content"][:30],
+            message_count=len(chunk),
+        )
+
+        leaf_segments.append(
+            SummarySegment(
+                content=latest_summary["content"],
+                token_count=latest_summary["token_count"],
+                message_id=latest_summary["message_id"],
+                message_public_id=latest_summary["message_public_id"],
+            )
+        )
+
+    if not leaf_segments:
+        raise ValueError("Cannot refresh summaries for an empty session")
+
+    current_segments = leaf_segments
+    while len(current_segments) > 1:
+        next_segments: list[SummarySegment] = []
+        for group in _chunk_segments_for_merge(current_segments, summary_type):
+            next_segments.append(await _merge_summary_segments(summary_type, group))
+        current_segments = next_segments
+
+    final_segment = current_segments[0]
+    final_summary = Summary(
+        content=final_segment["content"],
+        message_id=final_segment["message_id"],
+        summary_type=summary_type.value,
+        created_at=utc_now_iso(),
+        token_count=final_segment["token_count"],
+        message_public_id=final_segment["message_public_id"],
+    )
+
+    async with tracked_db("summary.refresh.save") as db:
+        await _save_summary(
+            db,
+            final_summary,
+            workspace_name,
+            session_name,
+        )
+
+
+async def refresh_session_summaries(
+    workspace_name: str,
+    session_name: str,
+    *,
+    refresh_short: bool = True,
+    refresh_long: bool = True,
+) -> None:
+    """
+    Force-regenerate stored summaries for a session using current settings.
+
+    This bypasses threshold/existence checks and rebuilds from the full message
+    history so changes to prompts, models, or token limits are reflected.
+    """
+    if not refresh_short and not refresh_long:
+        return
+
+    async with tracked_db("summary.refresh.fetch") as db:
+        await crud.get_session(db, session_name, workspace_name)
+
+        result = await db.execute(
+            select(models.Message)
+            .where(models.Message.workspace_name == workspace_name)
+            .where(models.Message.session_name == session_name)
+            .order_by(models.Message.seq_in_session.asc())
+        )
+        messages = [
+            SummaryRefreshMessage(
+                id=message.id,
+                public_id=message.public_id,
+                peer_name=message.peer_name,
+                content=message.content,
+                token_count=message.token_count,
+            )
+            for message in result.scalars().all()
+        ]
+
+    if not messages:
+        raise ValueError("Cannot refresh summaries for an empty session")
+
+    tasks = []
+    if refresh_short:
+        tasks.append(
+            _rebuild_summary_from_scratch(
+                workspace_name,
+                session_name,
+                summary_type=SummaryType.SHORT,
+                messages=messages,
+            )
+        )
+    if refresh_long:
+        tasks.append(
+            _rebuild_summary_from_scratch(
+                workspace_name,
+                session_name,
+                summary_type=SummaryType.LONG,
+                messages=messages,
+            )
+        )
+
+    await asyncio.gather(*tasks)
 
 
 async def get_summarized_history(
