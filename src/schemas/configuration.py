@@ -100,6 +100,10 @@ class WorkspaceConfiguration(BaseModel):
         default=None,
         description="Configuration for dream functionality. If reasoning is disabled, dreams will also be disabled and these settings will be ignored.",
     )
+    language: str | None = Field(
+        default=None,
+        description="Primary language of the workspace/session content (e.g. 'Estonian', 'English'). When set, the deriver and dreamer are instructed to write observations and peer card entries in this language regardless of how the prompts/examples are written.",
+    )
 
 
 class SessionConfiguration(WorkspaceConfiguration):
@@ -154,6 +158,7 @@ class ResolvedConfiguration(BaseModel):
     peer_card: ResolvedPeerCardConfiguration
     summary: ResolvedSummaryConfiguration
     dream: ResolvedDreamConfiguration
+    language: str | None = None
 
     @model_validator(mode="before")
     @classmethod

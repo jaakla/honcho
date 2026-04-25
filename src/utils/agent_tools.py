@@ -270,7 +270,8 @@ TOOLS: dict[str, dict[str, Any]] = {
             "Update the peer card with durable profile facts about the observed peer. "
             + "Only include stable biographical facts, standing instructions, and long-lived preferences/traits. "
             + "Do not include one-off conclusions, temporary events, or duplicate entries. "
-            + "Preserve the language of the supporting evidence and existing peer card entries."
+            + "Write entries in the language of the source evidence (or the workspace language if specified in the system prompt). "
+            + "If existing peer card entries are in a different language than the source evidence, REWRITE them in the source/workspace language — do not preserve them just because they were already there."
         ),
         "input_schema": {
             "type": "object",
@@ -280,7 +281,8 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "description": (
                         "Complete deduplicated peer card list (max 40 entries). "
                         + "Each entry should be a concise standalone profile fact. "
-                        + "Preserve the language of the source evidence; do not translate entries to English."
+                        + "Write entries in the language of the source evidence (or workspace language if set). "
+                        + "Do not default to English. Rewrite stale-language entries to match."
                     ),
                     "items": {"type": "string"},
                 },

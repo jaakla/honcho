@@ -47,8 +47,18 @@ async def _call_llm(prompt: str, max_tokens: int = 500) -> str:
 
 def test_deriver_prompt_includes_language_preservation():
     prompt = minimal_deriver_prompt(peer_id="alice", messages="alice: Tere maailm")
-    assert "LANGUAGE PRESERVATION" in prompt
-    assert "Do NOT translate observations" in prompt
+    assert "LANGUAGE" in prompt
+    assert "Do NOT translate" in prompt
+
+
+def test_deriver_prompt_with_explicit_language():
+    prompt = minimal_deriver_prompt(
+        peer_id="alice",
+        messages="alice: Tere maailm",
+        language="Estonian",
+    )
+    assert "Estonian" in prompt
+    assert "Write EVERY observation in Estonian" in prompt
 
 
 def test_summary_prompts_include_language_preservation():
@@ -73,10 +83,23 @@ def test_dream_specialist_prompts_include_language_preservation():
     deduction_prompt = DeductionSpecialist().build_system_prompt("alice")
     induction_prompt = InductionSpecialist().build_system_prompt("alice")
 
-    assert "LANGUAGE PRESERVATION" in deduction_prompt
-    assert "Do NOT translate created observations or peer card entries" in deduction_prompt
-    assert "LANGUAGE PRESERVATION" in induction_prompt
-    assert "Do NOT translate created observations or peer card entries" in induction_prompt
+    assert "LANGUAGE" in deduction_prompt
+    assert "Do NOT translate to English" in deduction_prompt
+    assert "LANGUAGE" in induction_prompt
+    assert "Do NOT translate to English" in induction_prompt
+
+
+def test_dream_specialist_prompts_with_explicit_language():
+    deduction_prompt = DeductionSpecialist().build_system_prompt(
+        "alice", language="Estonian"
+    )
+    induction_prompt = InductionSpecialist().build_system_prompt(
+        "alice", language="Estonian"
+    )
+    assert "Write EVERY new observation in Estonian" in deduction_prompt
+    assert "Write EVERY peer card entry in Estonian" in deduction_prompt
+    assert "Write EVERY new observation in Estonian" in induction_prompt
+    assert "Write EVERY peer card entry in Estonian" in induction_prompt
 
 
 # --- LLM integration tests (make real API calls) ---

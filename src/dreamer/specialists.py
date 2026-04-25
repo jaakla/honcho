@@ -84,10 +84,41 @@ class BaseSpecialist(ABC):
 
     @abstractmethod
     def build_system_prompt(
-        self, observed: str, *, peer_card_enabled: bool = True
+        self,
+        observed: str,
+        *,
+        peer_card_enabled: bool = True,
+        language: str | None = None,
     ) -> str:
         """Build the system prompt for this specialist."""
         ...
+
+    @staticmethod
+    def _build_language_block(language: str | None) -> str:
+        """Build the LANGUAGE block hoisted to the top of every specialist system prompt.
+
+        When `language` is set, the model is told to write in that language unconditionally.
+        When unset, it must mirror the language of the source observations/messages.
+        """
+        if language:
+            return (
+                f"## LANGUAGE — STRICT (HIGHEST PRIORITY)\n\n"
+                f"- The primary language of this workspace is **{language}**.\n"
+                f"- Write EVERY new observation in {language}.\n"
+                f"- Write EVERY peer card entry in {language}.\n"
+                f"- Do NOT translate to English. Do NOT mix languages. "
+                f"This rule overrides any English example or label found elsewhere in this prompt.\n"
+                f"- If you encounter existing observations or peer card entries in another language, "
+                f"rewrite them in {language} when consolidating.\n"
+            )
+        return (
+            "## LANGUAGE — STRICT (HIGHEST PRIORITY)\n\n"
+            "- Write each new observation in the SAME language as the source observations/messages it derives from.\n"
+            "- Write each peer card entry in the language of its supporting evidence.\n"
+            "- Do NOT translate to English. Do NOT mix languages. "
+            "This rule overrides any English example or label found elsewhere in this prompt.\n"
+            "- When sources span multiple languages, use the dominant language of the sources — never default to English.\n"
+        )
 
     @abstractmethod
     def build_user_prompt(
@@ -167,11 +198,14 @@ If you update it, send the full deduplicated list and remove stale entries.
         # DB session closed — LLM calls happen without holding a connection
 
         # Build messages
+        language = configuration.language if configuration is not None else None
         messages: list[dict[str, str]] = [
             {
                 "role": "system",
                 "content": self.build_system_prompt(
-                    observed, peer_card_enabled=peer_card_enabled
+                    observed,
+                    peer_card_enabled=peer_card_enabled,
+                    language=language,
                 ),
             },
             {
@@ -294,7 +328,7 @@ class DeductionSpecialist(BaseSpecialist):
     """
 
     name: str = "deduction"
-    peer_card_update_instruction: str = "Update this with `update_peer_card` only for stable biographical/profile facts."
+    peer_card_update_instruction: str = "Update this with `update_peer_card` for stable facts, group memberships, recurring political stances, and distinctive themes the peer returns to repeatedly."
 
     def get_tools(self, *, peer_card_enabled: bool = True) -> list[dict[str, Any]]:
         if peer_card_enabled:
@@ -315,42 +349,65 @@ class DeductionSpecialist(BaseSpecialist):
         return 12
 
     def build_system_prompt(
-        self, observed: str, *, peer_card_enabled: bool = True
+        self,
+        observed: str,
+        *,
+        peer_card_enabled: bool = True,
+        language: str | None = None,
     ) -> str:
+        language_block = self._build_language_block(language)
+        language_reminder = (
+            f"REMINDER: Write every entry in {language}. The format labels above are illustrative — translate them or use {language} equivalents."
+            if language
+            else "REMINDER: Write every entry in the language of its supporting evidence (the format labels above are illustrative; use equivalents in the source language)."
+        )
+
         peer_card_section = ""
         if peer_card_enabled:
-            peer_card_section = """
+            peer_card_section = f"""
 
 ## PEER CARD (REQUIRED)
 
-The peer card is a summary of stable biographical facts. You MUST update it when you learn:
+The peer card is a durable profile summary. You MUST update it when you learn any of the following about {observed}:
 - Name, age, location, occupation
 - Family members and relationships
 - Standing instructions ("call me X", "don't mention Y")
 - Core preferences and traits
+- Membership of organizations, political parties and others
+- Recurring political stances or policy positions (e.g. critical of state surveillance, pro-public-transport)
+- Distinctive rhetorical themes or arguments the peer returns to repeatedly across multiple sessions
+- Recurring criticisms, targets, or opponents (when sustained across many messages, not single events)
 
-Never add temporary event summaries, one-off conclusions, reasoning traces, or contradiction notes.
+Every peer card entry must be a fact about {observed} themselves. Do not include facts about other people they have mentioned, addressed, or referenced — even if those facts appear repeatedly.
+
+Never add **single-event summaries** that don't reflect a recurring pattern. Never add reasoning traces or one-off contradiction notes. But DO record stances and themes that show up across multiple sessions — those ARE durable profile facts for someone like a politician, journalist, or domain expert.
 
 Format entries as:
 - Plain facts: "Name: Alice", "Works at Google", "Lives in NYC"
 - `INSTRUCTION: ...` for standing instructions
 - `PREFERENCE: ...` for preferences
 - `TRAIT: ...` for personality traits
+- `POLITICS: ...` for political stances or policy positions
+- `PATTERN: ...` for distinctive recurring themes, arguments, or rhetorical habits (must show up across multiple sessions or many messages)
 
-Call `update_peer_card` with the complete updated list when you have new biographical info.
-Keep it concise (max 40 entries), deduplicated, and current."""
+Entries must describe {observed}. Do not write entries of the form 'OtherName: …'.
+
+{language_reminder}
+
+Call `update_peer_card` with the complete updated list when you have new biographical info, a new recurring stance, or a new pattern.
+Keep it concise (max 40 entries), deduplicated, and current.
+
+## MANDATORY UPDATE
+
+Before finishing this dream, you MUST call `update_peer_card` at least once if you have created any new observations during this run, even if the update is small (e.g. adding a single new entry, refining wording, or removing a stale entry). Do not silently skip the peer card. If you genuinely have nothing new to add, send the existing card back unchanged so we can confirm you considered it."""
 
         return f"""You are a deductive reasoning agent analyzing observations about {observed}.
+
+{language_block}
 
 ## YOUR JOB
 
 Create deductive observations by finding logical implications in what's already known. Think like a detective connecting evidence.
-
-## LANGUAGE PRESERVATION
-
-- Preserve the language used in the source observations and messages.
-- Do NOT translate created observations or peer card entries into English.
-- When multiple source items support one new observation, write it in the dominant language of those sources.
 
 ## PHASE 1: DISCOVERY
 
@@ -443,7 +500,7 @@ class InductionSpecialist(BaseSpecialist):
     """
 
     name: str = "induction"
-    peer_card_update_instruction: str = "Only add highly stable profile traits/preferences; do not copy transient conclusions."
+    peer_card_update_instruction: str = "Update with stable profile traits/preferences, political views, recurring patterns, and distinctive themes the peer returns to repeatedly."
 
     def get_tools(self, *, peer_card_enabled: bool = True) -> list[dict[str, Any]]:
         if peer_card_enabled:
@@ -464,34 +521,58 @@ class InductionSpecialist(BaseSpecialist):
         return 10
 
     def build_system_prompt(
-        self, observed: str, *, peer_card_enabled: bool = True
+        self,
+        observed: str,
+        *,
+        peer_card_enabled: bool = True,
+        language: str | None = None,
     ) -> str:
+        language_block = self._build_language_block(language)
+        language_reminder = (
+            f"REMINDER: Write every entry in {language}. The format labels above are illustrative — translate them or use {language} equivalents."
+            if language
+            else "REMINDER: Write every entry in the language of its supporting evidence (the format labels above are illustrative; use equivalents in the source language)."
+        )
+
         peer_card_section = ""
         if peer_card_enabled:
-            peer_card_section = """
+            peer_card_section = f"""
 
 ## PEER CARD (REQUIRED)
 
-After identifying patterns, only update the peer card for durable profile-level traits/preferences:
+After identifying patterns, update the peer card for durable profile-level traits, preferences, political views/beliefs, distinctive recurring themes and other general traits like:
 - `TRAIT: Analytical thinker`
 - `TRAIT: Tends to reschedule when stressed`
 - `PREFERENCE: Prefers detailed explanations`
+- `POLITICS: Left or right-wing, liberal or conservative, democrat, autocrat, technocrat etc`
+- `INTEREST: topics they repeatedly discuss, domains they care about`
+- `BELIEF: repeated claims about how the world works`
+- `VALUES: what they optimize for: fairness, efficiency, freedom, safety, loyalty, transparency, status, truth, etc.`
+- `WORLDVIEW: recurring assumptions about institutions, technology, people, markets, risk, progress, authority`
+- `PATTERN: distinctive recurring themes, arguments, or rhetorical habits the peer returns to across multiple sessions or many messages`
 
-Do NOT add temporary patterns, episode-specific conclusions, or reasoning summaries.
-Call `update_peer_card` with the complete deduplicated list only when a durable profile update is warranted.
-Keep it concise (max 40 entries)."""
+Every peer card entry must be a fact about {observed} themselves. Do not include facts about other people they have mentioned, addressed, or referenced — even if those facts appear repeatedly.
+
+Do NOT add **single-event summaries** or one-off conclusions. But DO add patterns and stances that show up across multiple sessions — those are exactly what this card is for. For someone like a politician, journalist, or domain expert, recurring stances and rhetorical habits ARE the most defining profile facts.
+
+Political world views and beliefs should be included under politics.
+
+{language_reminder}
+
+Call `update_peer_card` with the complete deduplicated list when you have new patterns, stances, or themes worth recording.
+Keep it concise (max 40 entries).
+
+## MANDATORY UPDATE
+
+Before finishing this dream, you MUST call `update_peer_card` at least once if you have created any new inductive observations during this run, even if the update is small (e.g. adding a single new entry, refining wording, or removing a stale entry). Do not silently skip the peer card. If you genuinely have nothing new to add, send the existing card back unchanged so we can confirm you considered it."""
 
         return f"""You are an inductive reasoning agent identifying patterns about {observed}.
+
+{language_block}
 
 ## YOUR JOB
 
 Create inductive observations by finding patterns across multiple observations. Think like a psychologist identifying behavioral tendencies.
-
-## LANGUAGE PRESERVATION
-
-- Preserve the language used in the source observations and messages.
-- Do NOT translate created observations or peer card entries into English.
-- When multiple source items support one new observation, write it in the dominant language of those sources.
 
 ## PHASE 1: DISCOVERY
 

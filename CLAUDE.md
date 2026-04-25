@@ -74,6 +74,10 @@ All API routes follow the pattern: `/v1/{resource}/{id}/{action}`
 
 ## Development Guide
 
+### Documentation requirement
+- Record all new major features and requirements in PRODUCT_REQUIREMENTS.md file. 
+- Mark them as NEW: CHANGE: REMOVE: BUG: (and other types/statuses if needed), and keep them in the implementatation order.
+
 ### Commands
 
 - Setup: `uv sync`

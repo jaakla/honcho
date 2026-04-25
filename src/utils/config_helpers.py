@@ -112,6 +112,7 @@ def get_configuration(
             "messages_per_long_summary": settings.SUMMARY.MESSAGES_PER_LONG_SUMMARY,
         },
         "dream": {"enabled": settings.DREAM.ENABLED},
+        "language": None,
     }
 
     # Apply overrides in order (Workspace -> Session -> Message)
